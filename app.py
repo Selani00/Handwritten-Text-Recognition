@@ -1,22 +1,74 @@
-import streamlit as st
-from PIL import Image
+from flask import Flask, request, jsonify
+from ultralytics import YOLO
+import cv2
+import easyocr
+import numpy as np
 
-# Set the title of the app
-st.title("Image Uploader")
+app = Flask(__name__)
 
-# Create a file uploader widget
-uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
+# Load a pre-trained YOLOv10n model
+model = YOLO("yolov10n.pt")
 
-if uploaded_file is not None:
-    # Open the uploaded image
-    image = Image.open(uploaded_file)
+@app.route('/upload', methods=['POST'])
+def upload_image():
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image provided'}), 400
 
-    # Display the uploaded image
-    st.image(image, caption="Uploaded Image", use_column_width=True)
-    st.write("")
-    st.write("Classifying...")
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
 
-    # You can add your image processing code here
-    # For example, call your Flask API to perform object detection and text recognition
-    # result = your_flask_api_call(image)
-    # st.write(result)
+    # Read image file as a NumPy array
+    npimg = np.fromfile(file, np.uint8)
+    image = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+
+    # Perform object detection
+    results = model(image)
+
+    # Extract and display the detected objects
+    detected_objects = results[0].boxes
+
+    # Create a set to avoid duplicate object names
+    object_names = set()
+    person_detected = False
+
+    for box in detected_objects:
+        class_id = int(box.cls[0])
+        object_name = results[0].names[class_id]
+        object_names.add(object_name)
+        if object_name == 'person':
+            person_detected = True
+
+    response = {'objects': list(object_names)}
+
+    # Check if a person is detected in the image
+    if person_detected:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blur = cv2.medianBlur(gray, 5)
+        thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 8)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        dilate = cv2.dilate(thresh, kernel, iterations=6)
+        cnts = cv2.findContours(dilate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            ROI = image[y:y+h, x:x+w]
+            break
+
+        # Use EasyOCR to read text from the cropped region
+        reader = easyocr.Reader(['en'])
+        result = reader.readtext(ROI)
+        text_results = [{'text': text, 'probability': prob} for (bbox, text, prob) in result]
+
+        response['person_detected'] = True
+        response['text_results'] = text_results
+    else:
+        response['person_detected'] = False
+
+    return jsonify(response)
+
+if __name__ == '__main__':
+    app.run(debug=True)
